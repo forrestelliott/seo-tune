@@ -90,6 +90,7 @@ scope before running on an unfamiliar site.
 python3 -m unittest discover -s tests -v
 bash -n scripts/hosts.sh
 node --check templates/indexnow.mjs
+node --check templates/lastmod.mjs
 ```
 
 Tests use synthetic pages and an ephemeral loopback HTTP server. They require
@@ -115,6 +116,15 @@ and create that site's own verification key. Use `--dry-run` first. A real run
 submits URLs to IndexNow only after confirming the public key file is live.
 Submission does not guarantee crawling, indexing, or ranking, and Google does
 not use IndexNow.
+
+## Sitemap dates
+
+`templates/lastmod.mjs`, also opt-in, gives a statically built site honest
+`<lastmod>` dates: the day each page's content (its visible words and JSON-LD,
+not its title or description) last changed. Chain it after the build; it keeps
+fingerprints and dates in a JSON file you commit and writes the dates into the
+built sitemap. Its `--check` mode fails while that file has uncommitted
+changes. IndexNow's default "submit what changed today" relies on these dates.
 
 ## Privacy
 

@@ -18,7 +18,7 @@ in Codex.
 - **Network:** live audits fetch public URLs. A sandbox-blocked request is
   "not measured", never an SEO finding; request the necessary network access.
 - **Scripts:** Python 3 standard library, Bash, curl; Node.js 18+ for the
-  optional IndexNow template. No third-party runtime packages are required.
+  optional IndexNow and sitemap-date templates. No third-party runtime packages are required.
 - **Subagents:** optional. Use them only when delegation is available and
   authorized; otherwise perform the same work in-session.
 
@@ -37,7 +37,8 @@ in Codex.
   plan/pricing config before writing "free", "PDF", "no signup", numbers, or
   feature names. Never promise formats the product doesn't produce ("Word",
   "no watermark"). Don't bump "last updated"/lastmod dates for meta-only changes
-  unless the project's rules say to; comparison pages that claim a fact review
+  unless the project's rules say to (`templates/lastmod.mjs` follows this: it
+  fingerprints content, not titles or descriptions); comparison pages that claim a fact review
   must not get a new date without one.
 - **Prove checks can fail.** Any new validator or smoke check: run it once
   against a state where it must fail (pre-deploy, or a tightened threshold)
@@ -222,9 +223,27 @@ URLs. Local HTML checks cannot verify deployed HTTP headers or status codes.
   The script refuses to submit until the key file is served with the right
   body: SPA fallbacks return 200 HTML for missing files, so status alone lies.
   Add the same body check to the project's smoke test if it has one.
+- **Give the sitemap honest lastmod dates first.** By default `indexnow.mjs`
+  submits sitemap URLs dated today, so it only works if each `<lastmod>` is the
+  day that page's content last changed. A publish date (or none) means it finds
+  nothing after a deploy that changed pages; the build date on every URL means it
+  resubmits pages that didn't change. For a static build, copy
+  `<skill-dir>/templates/lastmod.mjs`, set `DIST`, `STORE` and `SITEMAPS`, and
+  chain it after the build (`… && node scripts/lastmod.mjs`). It fingerprints
+  each page's visible words and JSON-LD, dates changed pages in a committed JSON
+  store, and writes the dates into the built sitemap. Add
+  `node scripts/lastmod.mjs --check` to the pre-deploy check (fails while the
+  store isn't committed), and prove both can fail: a second build must date
+  nothing, and an edited store must fail the check. For a server-rendered
+  sitemap, read the store in the sitemap code instead.
 - Document the post-deploy order in the project's agent instructions:
   deploy → smoke → `node scripts/indexnow.mjs` (URLs whose sitemap lastmod is
-  today; `--all` once on first run; never resubmit unchanged URLs).
+  today; `--all` once on first run; never resubmit unchanged URLs). Submit
+  once, after the day's last deploy: a second same-day run resubmits what the
+  first sent. Without honest dates, submit explicit paths of the pages that
+  changed (`node scripts/indexnow.mjs /a /b`; `--dry-run` first). To pass a
+  list from a file, use `xargs node scripts/indexnow.mjs < paths.txt`: zsh
+  doesn't split an unquoted `$var` into words, so it arrives as one path.
 - After the user authorizes a push: wait for the deploy to serve the new build (poll
   a changed title), run smoke, then `sweep.py <prod> --compare <last
   snapshot> --save <new snapshot>`. An incomplete run exits 2: resolve the
