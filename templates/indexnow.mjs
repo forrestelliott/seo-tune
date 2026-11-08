@@ -69,10 +69,12 @@ if (paths.length > 0) {
     process.exit(1);
   }
   const xml = await res.text();
-  const entries = [...xml.matchAll(/<url>\s*<loc>([^<]+)<\/loc>\s*<lastmod>([^<]+)<\/lastmod>/g)]
+  // every <url>, with its lastmod where it has one: --all takes them all (a sitemap may date only
+  // some pages), a date or --since only the dated ones on or after it
+  const entries = [...xml.matchAll(/<url>\s*<loc>([^<]+)<\/loc>(?:\s*<lastmod>([^<]+)<\/lastmod>)?/g)]
     .map(([, loc, lastmod]) => ({ loc, lastmod }));
   const cutoff = since ?? today;
-  urls = entries.filter((e) => all || e.lastmod >= cutoff).map((e) => e.loc);
+  urls = entries.filter((e) => all || (e.lastmod && e.lastmod >= cutoff)).map((e) => e.loc);
 }
 
 if (urls.length === 0) {

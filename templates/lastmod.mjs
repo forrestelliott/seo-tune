@@ -13,8 +13,10 @@
  *   node scripts/lastmod.mjs --check   exit 1 while STORE has uncommitted changes (add it to the
  *                                      pre-deploy check, so a deploy always carries its dates)
  *
- * The fingerprint is the page's visible words plus its JSON-LD. Titles, meta descriptions,
- * styles and scripts are left out: a meta-only change doesn't bump lastmod (seo-tune's rule).
+ * The fingerprint is the visible words of the page's <main> plus its JSON-LD. Titles, meta
+ * descriptions, styles and scripts are left out: a meta-only change doesn't bump lastmod
+ * (seo-tune's rule). So are the header and footer every page shares: a new footer link would
+ * otherwise re-date every page. Pages without a <main> use the whole body.
  * Commit STORE. The host's build then finds every hash unchanged and keeps the dates; if
  * STORE wasn't committed, the host would re-date changed pages at every build.
  *
@@ -52,10 +54,10 @@ function pageFile(route) {
   return hit;
 }
 
-// a page's content: its JSON-LD and its visible words, without markup, styles or scripts
+// a page's content: its JSON-LD and the visible words of its <main>, without markup, styles or scripts
 function content(html) {
   const data = [...html.matchAll(/<script type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
-  const body = (html.split(/<body[^>]*>/)[1] || html)
+  const body = (html.match(/<main[\s>][\s\S]*<\/main>/)?.[0] || html.split(/<body[^>]*>/)[1] || html)
     .replace(/<(script|style|svg|template|noscript)[\s\S]*?<\/\1>/g, ' ')
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')

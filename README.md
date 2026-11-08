@@ -127,8 +127,9 @@ not use IndexNow.
 ## Sitemap dates
 
 `templates/lastmod.mjs`, also opt-in, gives a statically built site honest
-`<lastmod>` dates: the day each page's content (its visible words and JSON-LD,
-not its title or description) last changed. Chain it after the build; it keeps
+`<lastmod>` dates: the day each page's content (the visible words of its
+`<main>` and its JSON-LD, not its title, description, or shared header and
+footer) last changed. Chain it after the build; it keeps
 fingerprints and dates in a JSON file you commit and writes the dates into the
 built sitemap. Its `--check` mode fails while that file has uncommitted
 changes. IndexNow's default "submit what changed today" relies on these dates.

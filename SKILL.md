@@ -1,6 +1,6 @@
 ---
 name: seo-tune
-description: Audit and improve technical and brand SEO for a website using crawl checks, search-query data, metadata, structured data, share previews, and optional IndexNow submissions. Use for SEO tuning, brand-search visibility, or Search Console and Bing Webmaster exports. Works in Claude Code and Codex; run inside the target project repository.
+description: Audit and improve technical and brand SEO for a website using crawl checks, search-query data, metadata, structured data, share previews, and optional IndexNow submissions. Use for SEO tuning, fixing a site's SEO, a brand that doesn't show up on Google, or Search Console and Bing Webmaster exports. Works in Claude Code and Codex; run inside the target project repository.
 ---
 
 # SEO tune
@@ -276,8 +276,9 @@ URLs. Local HTML checks cannot verify deployed HTTP headers or status codes.
   resubmits pages that didn't change. For a static build, copy
   `<skill-dir>/templates/lastmod.mjs`, set `DIST`, `STORE` and `SITEMAPS`, and
   chain it after the build (`… && node scripts/lastmod.mjs`). It fingerprints
-  each page's visible words and JSON-LD, dates changed pages in a committed JSON
-  store, and writes the dates into the built sitemap. Add
+  the visible words of each page's `<main>` (not the shared header and footer,
+  or one footer link re-dates every page) and its JSON-LD, dates changed pages in
+  a committed JSON store, and writes the dates into the built sitemap. Add
   `node scripts/lastmod.mjs --check` to the pre-deploy check (fails while the
   store isn't committed), and prove both can fail: a second build must date
   nothing, and an edited store must fail the check. For a server-rendered
