@@ -66,10 +66,13 @@ in Codex.
 
 1. **Ask the user for available exports** (don't block on it; proceed and
    fold it in when it arrives):
-   - Google Search Console: Performance (queries + pages, 3 months) and URL
-     Inspection of the homepage (Google-selected canonical).
+   - Google Search Console: Performance (queries + pages, 3 months; use the
+     branded-queries filter where offered for the brand baseline), Search
+     Generative AI performance (impressions in AI Overviews, AI Mode, and
+     Discover's AI features), and URL Inspection of the homepage
+     (Google-selected canonical).
    - Bing Webmaster Tools: Page traffic, Keyword, and AI Performance
-     (Copilot citations) reports, plus Site Scan SEO warnings.
+     (sampled citations, no clicks) reports, plus Site Scan SEO warnings.
    - Check `docs/` for earlier audits first; they often already hold this.
 2. **Host hygiene**: `bash <skill-dir>/scripts/hosts.sh <canonical-host> [alt-domains...]`
    Include every domain that points at the app (short links, old brands).
@@ -84,15 +87,23 @@ in Codex.
    Pass the platform aliases too (`<project>.vercel.app`, `<site>.netlify.app`):
    they must redirect or be noindex. The script also probes staging/dev/
    preview/beta/test subdomains (custom preview domains are not auto-noindexed
-   on Vercel) and prints which crawlers robots.txt allows: search bots, AI
-   search bots (OAI-SearchBot, Claude-SearchBot, PerplexityBot), and AI
-   training bots (GPTBot, ClaudeBot, Google-Extended, CCBot) are separate
-   tokens. Report the current policy and let the user decide it; blocking AI
-   search bots removes the site from ChatGPT/Claude search answers, while
-   Google-Extended never affects Google Search.
+   on Vercel) and prints which crawlers robots.txt allows. Search bots, AI
+   search bots (OAI-SearchBot, Claude-SearchBot, PerplexityBot,
+   Meta-WebIndexer), user-triggered fetchers (ChatGPT-User, Claude-User,
+   Perplexity-User; OpenAI and Perplexity say these may not follow
+   robots.txt), and AI training bots (GPTBot, ClaudeBot, Google-Extended,
+   Applebot-Extended, CCBot, Meta-ExternalAgent) are separate tokens. Report
+   the current policy and let the user decide it. Blocking OAI-SearchBot
+   keeps the site out of ChatGPT search answers (navigational links can
+   remain); blocking Claude-SearchBot may reduce visibility in Claude's.
+   Google-Extended never affects Google Search. Leaving AI Overviews and AI
+   Mode is a separate site-wide Search Console setting ("Search generative
+   AI"): ask the owner for its state and report it the same way.
 3. **Per-page sweep**: `python3 <skill-dir>/scripts/sweep.py https://<host>`
    (or a built `dist/` folder); `--save docs/seo/snapshots/<date>.json` in the
    project (parent folders are created). Use distinct before/after filenames.
+   A bare host uses the `Sitemap:` lines in robots.txt, then `/sitemap.xml`,
+   `/sitemap-index.xml` (Astro), and `/sitemap_index.xml`.
    Exit codes: **0** means the scan completed without critical comparison
    drift, not zero SEO findings; **1** means critical drift; **2** means
    incomplete measurement or invalid input. Do not call a run verified if
@@ -108,14 +119,19 @@ in Codex.
      reported separately from effective indexing restrictions. Next.js 15.2+
      streams metadata into `<body>` on dynamic routes for user agents outside
      its `htmlLimitedBots` list, and Googlebot is outside it by default.
+     Search Console's URL Inspection live test (Google-InspectionTool) is
+     inside it, so a clean live test doesn't show what Googlebot receives.
    - **redirects** (not followed): a sitemap URL that redirects, 302/307 used
      for a permanent move, meta-refresh or NEXT_REDIRECT client redirects.
-   - **canonical targets** that 404 or are noindex (including header-only
-     restrictions and targets already in the sitemap); X-Robots-Tag or Link
-     canonical headers that disagree with the HTML.
-   - **sitemap vs robots.txt** (listed but disallowed), lastmod in the future
-     or identical everywhere, HTML over 1-2 MB (Googlebot reads the first
-     2 MB), http:// schema.org contexts, structured data on noindex pages.
+   - **canonical targets** that 404, redirect, or are noindex (including
+     header-only restrictions and targets already in the sitemap); `/a` and
+     `/a/` count as different URLs; X-Robots-Tag or Link canonical headers that
+     disagree with the HTML.
+   - **sitemap vs robots.txt** (listed but disallowed, by Google's longest-match
+     and wildcard rules), lastmod in the future or identical everywhere, a
+     sitemap declared on another host or scheme, HTML over 1-2 MB (Googlebot
+     reads the first 2 MB, uncompressed), http:// schema.org contexts,
+     structured data on noindex pages.
    Headline counts and title lengths are review heuristics, not proof of
    ranking penalties. Check embedded previews before proposing heading changes.
    Failed fetches are incomplete measurements, not missing metadata; a failed,
@@ -130,8 +146,9 @@ in Codex.
    Check inner pages too, not just the homepage.
 4. **Brand/entity check** on the homepage: is there `WebSite` JSON-LD (Google's
    site-name source) with `name` + `alternateName` (spelling variants people
-   search, e.g. "Example Brand")? `Organization` with `@id`, `logo` as a raster
-   PNG ≥112px (not SVG), `sameAs` to live profiles? Does the homepage title
+   search, e.g. "Example Brand")? `Organization` with `@id`, `logo` at least
+   112x112 in a Google Images format (SVG qualifies; PNG is safest for other
+   consumers), `sameAs` to live profiles? Does the homepage title
    lead with the brand? Search the web for the brand name and list which
    directories (Crunchbase, Capterra, G2, AlternativeTo, SaaSHub, Product Hunt,
    launch sites) have listings; those are `sameAs` candidates. Confirm each
@@ -160,8 +177,8 @@ Typical fixes, in priority order. Implement in the project's idiom (Next.js
 
 1. **Crawlability first** if the sweep found SPA-only titles or noindex leaks.
 2. **Brand claim**: homepage `WebSite` + `Organization` JSON-LD linked by `@id`,
-   `alternateName`, `legalName` if known, raster logo (render the SVG mark to a
-   512px PNG with the project's headless browser if none exists), `sameAs`
+   `alternateName`, `legalName` if known, logo (if only an SVG mark exists,
+   render a 512px PNG with the project's headless browser), `sameAs`
    limited to verified profiles. Homepage title brand-first
    ("Brand: what it is"), without a doubled "| Brand" suffix.
 3. **Duplicate hosts**: server-side 301/308 for the alternate domain's
@@ -182,9 +199,10 @@ Typical fixes, in priority order. Implement in the project's idiom (Next.js
 6. **Soft 404s**: return a real 404 where the platform allows, otherwise
    note it in the project's backlog (low priority when the JS redirects).
 7. **Share previews on every indexable page**: og:image and twitter:image
-   present and absolute, 1200x630, under ~600 KB (WhatsApp and iMessage drop
-   big previews; a photo in a generated PNG easily hits 850 KB), plus
-   og:title/og:description matching the page. Framework gotcha: when you add
+   present and absolute, 1200x630, under ~600 KB (WhatsApp's limit; a photo
+   in a generated PNG easily hits 850 KB), plus og:title/og:description
+   matching the page. WhatsApp also needs `<head>` within the first 300 KB of
+   HTML. Framework gotcha: when you add
    a per-page metadata helper (Next.js `openGraph`/`twitter` objects, a
    PageMeta component), setting those objects REPLACES the parent's, image
    included. The helper must set the image itself, or inner pages may ship
@@ -196,8 +214,12 @@ Typical fixes, in priority order. Implement in the project's idiom (Next.js
    draw glyphs the font lacks (✓) as SVG.
 8. **Metadata placement** (if the sweep flagged it): in Next.js set
    `htmlLimitedBots: /.*/` in next.config to turn off streaming metadata for
-   every user agent (15.2+); elsewhere, render the tags server-side in the
-   document head. Re-run the three-user-agent check afterwards.
+   every user agent (15.2+). With Cache Components on 16.3+, that pattern also
+   makes ordinary browser responses `private, no-store`
+   (vercel/next.js#96594). There, list crawlers instead: a custom value
+   replaces the default list, so copy the regex from the installed Next.js
+   (`html-bots.ts`) and add `Googlebot`. Elsewhere, render the tags server-side
+   in the document head. Re-run the three-user-agent check afterwards.
 9. **Redirects**: permanent moves as server 301/308 (Next.js:
    `permanentRedirect()` or `redirects` in next.config; plain `redirect()` is
    307, and a redirect after streaming starts becomes a client-side
@@ -259,13 +281,16 @@ URLs. Local HTML checks cannot verify deployed HTTP headers or status codes.
    canonical = your URL, then Request indexing. Check Pages report for how
    many sitemap URLs are indexed. Add any alternate domain as its own property.
 2. Bing Webmaster Tools → Import from Google Search Console (verifies site and
-   sitemap). Bing feeds ChatGPT search, Copilot, and DuckDuckGo.
+   sitemap). Bing powers Copilot and much of DuckDuckGo's results, and is
+   widely reported as a source for ChatGPT search.
 3. Rich Results Test (search.google.com/test/rich-results) on the homepage:
-   Organization should be valid. "Missing aggregateRating" on
-   SoftwareApplication is optional; never add ratings without real reviews
-   shown on that page. Use validator.schema.org to see WebSite too.
-4. Search Console → Add property → connect the brand's X / Instagram / YouTube
-   / TikTok (analytics only; shows whether profiles appear for the brand).
+   Organization should be valid. The SoftwareApplication rich result needs
+   `aggregateRating` or `review`; without real reviews shown on that page,
+   leave them out and go without that rich result. Use validator.schema.org
+   to see WebSite too.
+4. Search Console → Add property → add the brand's X / Instagram / YouTube /
+   TikTok as platform properties (analytics only; shows how those accounts'
+   content performs on Google Search).
 5. Make sure every directory listing links to the canonical URL with the exact
    brand spelling.
 6. Share previews: paste the homepage and one or two key inner URLs into
@@ -277,7 +302,8 @@ URLs. Local HTML checks cannot verify deployed HTTP headers or status codes.
 ## Phase 5 — Baseline and follow-up
 
 Record in the project's backlog/docs (not a scratch file): the date, brand
-query position, clicks/impressions, top pages with position and clicks, AI
+query position (branded-queries filter where offered), clicks/impressions,
+top pages with position and clicks, Search Generative AI impressions, AI
 citations if Bing shows them, and what changed. Set a follow-up about three
 weeks out to pull the same reports and compare clicks at similar positions.
 At the follow-up, check the Google Search Status Dashboard
@@ -293,10 +319,12 @@ shows the basics moved.
 - Project traffic from CTR curves ("+170 clicks/month"); compare real reports.
 - Chase keyword density or "keyword in the first 100 words".
 - Add Review/AggregateRating schema about the site's own business (Google
-  calls it self-serving), or FAQ/HowTo markup for rich results (Google stopped
-  showing those for almost every site).
+  calls it self-serving), or FAQ/HowTo markup for rich results (no site gets
+  them now; FAQ ended 2026-05-07).
 - Use the Google Indexing API for ordinary pages (job postings and
-  livestreams only), or treat llms.txt as a ranking lever.
+  livestreams only).
+- Add llms.txt, AI text files, or special schema for AI search. Google doesn't
+  use llms.txt, and says its generative AI features need none of these.
 - Cite retired tools (Mobile-Friendly Test, FID) or unsourced statistics.
 
 ## Completion report

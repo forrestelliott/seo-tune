@@ -254,6 +254,93 @@ class SweepTests(unittest.TestCase):
         self.assertTrue(snap['pages'][URL]['ua_checks']['bingbot']['noindex'])
         self.assertFalse(snap['pages'][URL]['noindex'])
 
+    def test_trailing_slash_canonical_mismatch_is_reported(self):
+        r = s.analyze(URL + 'pricing', 200, page(canonical=f'<link rel="canonical" href="{URL}pricing/">'), self_url=URL + 'pricing')
+        self.assertTrue(any('canonical ->' in p and 'trailing slash' in p for p in r['problems']), r['problems'])
+
+    def test_root_without_slash_is_same_url(self):
+        r = s.analyze(URL, 200, page(canonical='<link rel="canonical" href="https://example.test">'), self_url=URL)
+        self.assertFalse(any('canonical ->' in p for p in r['problems']), r['problems'])
+
+    def test_canonical_target_trailing_slash_form_is_fetched(self):
+        def override(url, ua):
+            if url.endswith('/sitemap.xml'):
+                return 200, {}, f'<urlset><url><loc>{URL}a</loc></url></urlset>'.encode()
+            if url == URL + 'a':
+                return 200, {}, page(canonical=f'<link rel="canonical" href="{URL}a/">').encode()
+            if url == URL + 'a/':
+                return 308, {'Location': URL + 'a'}, b''
+        code, output, _ = self.run_live_mock(override)
+        self.assertEqual(code, 0)
+        self.assertIn(f'canonical target {URL}a/ is 308', output)
+
+    def test_robots_longest_match_and_wildcards(self):
+        rules = s.Robots('User-agent: *\nDisallow: /_next/\nAllow: /_next/static/\nDisallow: /*?q=\nDisallow: /*.pdf$\n')
+        for path, expected in [('/_next/static/a.js', True), ('/_next/data/a.json', False), ('/search?q=1', False),
+                               ('/search', True), ('/doc.pdf', False), ('/doc.pdf?v=1', True), ('/', True)]:
+            with self.subTest(path=path):
+                self.assertEqual(rules.allowed('Googlebot', 'https://example.test' + path), expected)
+
+    def test_robots_tie_goes_to_allow(self):
+        rules = s.Robots('User-agent: *\nDisallow: /page\nAllow: /page\n')
+        self.assertTrue(rules.allowed('Googlebot', 'https://example.test/page'))
+
+    def test_robots_most_specific_group_only(self):
+        rules = s.Robots('User-agent: *\nDisallow: /\n\nUser-agent: GPTBot\nUser-agent: Googlebot\nDisallow: /private\n')
+        self.assertTrue(rules.allowed('Googlebot', 'https://example.test/a'))
+        self.assertFalse(rules.allowed('googlebot', 'https://example.test/private/x'))
+        self.assertFalse(rules.allowed('Bingbot', 'https://example.test/a'))
+
+    def test_robots_groups_merge_and_empty_disallow_allows(self):
+        rules = s.Robots('User-agent: A\nDisallow: /x\n\nUser-agent: A\nDisallow: /y\n\nUser-agent: B\nDisallow:\n')
+        self.assertFalse(rules.allowed('A', 'https://example.test/y'))
+        self.assertFalse(rules.allowed('A', 'https://example.test/x'))
+        self.assertTrue(rules.allowed('B', 'https://example.test/x'))
+
+    def test_robots_collects_sitemaps_and_ignores_unknown_lines(self):
+        rules = s.Robots('\ufeff# hi\nSitemap: https://example.test/sitemap-index.xml # note\nContent-Signal: search=yes\nUser-agent: *\nAllow: /\n')
+        self.assertEqual(rules.sitemaps, ['https://example.test/sitemap-index.xml'])
+        self.assertTrue(rules.allowed('Googlebot', URL))
+
+    def test_allow_rule_keeps_sitemap_url_from_being_flagged(self):
+        def override(url, ua):
+            if url.endswith('/robots.txt'):
+                return 200, {}, b'User-agent: *\nDisallow: /\nAllow: /$\n'
+        code, output, snap = self.run_live_mock(override)
+        self.assertEqual(code, 0)
+        self.assertNotIn('blocked by robots.txt', output)
+
+    def discover(self, routes):
+        def fetch(url, ua=s.UA, limit=None):
+            return routes.get(url, (404, {}, b''))
+        with patch.object(s, 'fetch', side_effect=fetch):
+            return s.discover_sitemaps('https://example.test/')
+
+    def test_sitemap_discovery_prefers_robots_declaration(self):
+        robots = (200, {}, b'Sitemap: https://example.test/sitemap-index.xml\nUser-agent: *\nAllow: /\n')
+        self.assertEqual(self.discover({URL + 'robots.txt': robots}), [URL + 'sitemap-index.xml'])
+
+    def test_sitemap_discovery_falls_back_to_astro_default(self):
+        found = self.discover({URL + 'robots.txt': (200, {}, b'User-agent: *\nAllow: /\n'),
+                               URL + 'sitemap-index.xml': (200, {}, b'<sitemapindex/>')})
+        self.assertEqual(found, [URL + 'sitemap-index.xml'])
+
+    def test_sitemap_discovery_stops_on_failure_not_404(self):
+        found = self.discover({URL + 'sitemap.xml': (503, {}, b'down'),
+                               URL + 'sitemap-index.xml': (200, {}, b'<sitemapindex/>')})
+        self.assertEqual(found, [URL + 'sitemap.xml'])
+
+    def test_sitemap_discovery_reports_conventional_path_when_nothing_found(self):
+        self.assertEqual(self.discover({}), [URL + 'sitemap.xml'])
+
+    def test_cross_host_sitemap_declaration_is_noted(self):
+        def override(url, ua):
+            if url.endswith('/robots.txt'):
+                return 200, {}, b'Sitemap: https://app.vercel.app/sitemap.xml\nUser-agent: *\nAllow: /\n'
+        code, output, _ = self.run_live_mock(override)
+        self.assertEqual(code, 0)
+        self.assertIn('robots.txt declares a sitemap on another host', output)
+
     def test_same_save_compare_path_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); (root / 'index.html').write_text(page())

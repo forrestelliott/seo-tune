@@ -22,6 +22,7 @@ trap 'rm -rf "$PROBE_DIR"' EXIT
 MAIN="${1:?usage: hosts.sh canonical-host [alt-hosts...]}"
 shift
 UA="Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 head_line() {
   curl -sS -o /dev/null -A "$UA" --max-time 15 \
@@ -88,9 +89,12 @@ done
 
 echo
 echo "== Crawler access to / per robots.txt (decide this on purpose)"
-python3 - "https://$MAIN" <<'PY'
-import sys, urllib.request, urllib.robotparser
-base = sys.argv[1]
+python3 -I - "$SCRIPT_DIR" "https://$MAIN" <<'PY'
+import sys, urllib.error, urllib.request
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+from sweep import Robots  # Google's precedence rules; urllib.robotparser differs.
+base = sys.argv[2]
 try:
     with urllib.request.urlopen(urllib.request.Request(base + "/robots.txt", headers={"User-Agent": "Mozilla/5.0"}), timeout=15) as r:
         status, text = r.status, r.read().decode("utf-8", "replace")
@@ -100,15 +104,16 @@ except Exception as e:  # noqa: BLE001
     print(f"  robots.txt not measured ({e.__class__.__name__})"); sys.exit()
 if status >= 500:
     print(f"  robots.txt HTTP {status}: crawlers treat this as disallow-all. PROBLEM"); sys.exit()
-rp = urllib.robotparser.RobotFileParser(); rp.parse(text.splitlines())
+rules = Robots(text)
 groups = {
     "search": ["Googlebot", "Bingbot", "Applebot", "DuckDuckBot"],
-    "AI search / user fetch": ["OAI-SearchBot", "ChatGPT-User", "Claude-SearchBot", "Claude-User", "PerplexityBot"],
+    "AI search": ["OAI-SearchBot", "Claude-SearchBot", "PerplexityBot", "Meta-WebIndexer"],
+    "AI user-triggered fetch": ["ChatGPT-User", "Claude-User", "Perplexity-User"],
     "AI training": ["GPTBot", "ClaudeBot", "Google-Extended", "Applebot-Extended", "CCBot", "Meta-ExternalAgent"],
 }
 for label, bots in groups.items():
-    print(f"  {label:24} " + "  ".join(f"{b}:{'allow' if rp.can_fetch(b, base + '/') else 'BLOCK'}" for b in bots))
-print(f"  (robots.txt HTTP {status}; Google-Extended only affects Gemini training, never Search)")
+    print(f"  {label:24} " + "  ".join(f"{b}:{'allow' if rules.allowed(b, base + '/') else 'BLOCK'}" for b in bots))
+print(f"  (robots.txt HTTP {status}; Google-Extended never affects Google Search; user-triggered fetchers may not honor robots.txt)")
 PY
 
 echo

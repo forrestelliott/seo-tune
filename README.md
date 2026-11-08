@@ -5,14 +5,15 @@ served HTML and crawl configuration, use real search-query data to prioritize
 fixes, and compare the result with a saved baseline.
 
 Includes a portable agent workflow, dependency-free audit scripts, synthetic
-HTTP fixtures, 36 regression tests, and an optional IndexNow submission template.
+HTTP fixtures, regression tests, and an optional IndexNow submission template.
 
 ## What it checks
 
 - Canonical and alternate hosts, redirects, soft 404s, crawler policies, and
   staging/preview exposure.
-- Titles, descriptions, canonical tags, robots directives, H1 counts, JSON-LD,
-  share images, sitemap entries, and metadata placement.
+- Titles, descriptions, canonical tags (including trailing-slash mismatches),
+  robots directives, H1 counts, JSON-LD, share images, sitemap entries found
+  through robots.txt or the common paths, and metadata placement.
 - Googlebot, Bingbot, and browser **user-agent response differences**. These are
   HTTP requests with those headers, not requests from verified crawler IPs.
 - Critical drift between scans, including new noindex, failed pages, changed

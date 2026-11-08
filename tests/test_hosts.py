@@ -10,6 +10,20 @@ HOSTS = Path(__file__).resolve().parents[1] / 'scripts/hosts.sh'
 
 
 class HostsTests(unittest.TestCase):
+    def test_crawler_table_loads_shared_parser(self):
+        """Real Python, fake curl: reserved .test never resolves, so the table
+        must reach its 'not measured' path rather than fail importing sweep."""
+        with tempfile.TemporaryDirectory() as tmp:
+            curl = Path(tmp) / 'curl'
+            curl.write_text('#!/bin/sh\nexit 0\n')
+            curl.chmod(0o755)
+            result = subprocess.run(['bash', str(HOSTS), 'example.test'], cwd=tmp,
+                                    env={**os.environ, 'PATH': tmp + os.pathsep + os.environ['PATH']},
+                                    capture_output=True, text=True, timeout=30)
+            self.assertNotIn('ModuleNotFoundError', result.stderr)
+            self.assertNotIn('Traceback', result.stderr)
+            self.assertIn('robots.txt not measured', result.stdout)
+
     def test_dns_tls_timeout_and_stale_response(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

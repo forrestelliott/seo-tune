@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-page SEO sweep over a sitemap (live URL) or a built dist/ folder. Read-only.
 
-    sweep.py https://example.com            # every <loc> in /sitemap.xml
+    sweep.py https://example.com            # sitemaps from robots.txt, else the usual paths
     sweep.py https://example.com/sitemap-0.xml
     sweep.py ./dist                          # prerendered/static HTML files on disk
     --all            print every page, not just problems
@@ -32,8 +32,11 @@ some user agents, and Google only honors a canonical in <head>.
 Site level (live mode): each distinct share image is fetched once (status,
 content type, size, dimensions; want 1200x630 under ~600 KB), non-self
 canonical targets must be 200 and indexable, sitemap URLs must not be
-blocked by robots.txt for Googlebot, and lastmod dates must not be in the
-future or all identical. Sitemap indexes are followed one level.
+blocked by robots.txt for Googlebot (Google's longest-match and wildcard
+rules), and lastmod dates must not be in the future or all identical.
+A bare site URL uses the Sitemap: lines in robots.txt, then /sitemap.xml,
+/sitemap-index.xml and /sitemap_index.xml. Sitemap indexes are followed one
+level. /a and /a/ are different URLs; only an empty path equals /.
 
 A present, loading share image can still be broken (overlapping text,
 missing font): open every distinct image the summary lists and look at it.
@@ -49,10 +52,9 @@ import re
 import struct
 import sys
 import urllib.request
-import urllib.robotparser
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from collections import Counter
 from pathlib import Path
 
@@ -64,6 +66,7 @@ UAS = {
 UA = UAS["googlebot"]
 DESC_MIN, DESC_MAX, TITLE_MAX = 110, 160, 65
 HTML_WARN, HTML_MAX = 1024 * 1024, 2 * 1024 * 1024
+SITEMAP_PATHS = ("/sitemap.xml", "/sitemap-index.xml", "/sitemap_index.xml")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -161,6 +164,71 @@ def sitemap_entries(url):
     return list(dict.fromkeys(read(url, True)))
 
 
+class Robots:
+    """robots.txt as Google documents it (RFC 9309): the most specific group
+    applies, the longest matching rule wins, a tie goes to Allow, and * and a
+    final $ are wildcards. urllib.robotparser uses first-match order and reads
+    wildcards as literal text, so it reports allowed paths as blocked and misses
+    wildcard blocks."""
+    SAFE = "/%*$?=&:;,+@!'()~[]"
+
+    def __init__(self, source):
+        self.groups, self.sitemaps = {}, []
+        agents, in_rules = [], False
+        for line in source.lstrip("\ufeff").splitlines():
+            key, sep, value = line.split("#", 1)[0].partition(":")
+            key, value = key.strip().lower(), value.strip()
+            if not sep:
+                continue
+            if key == "sitemap" and value:
+                self.sitemaps.append(value)
+            elif key == "user-agent":
+                if in_rules:
+                    agents, in_rules = [], False
+                agent = value.split("/")[0].strip().lower()
+                agents.append(agent)
+                self.groups.setdefault(agent, [])
+            elif key in ("allow", "disallow") and agents:
+                in_rules = True
+                if value:
+                    rule = (*self.compile(value), key == "allow")
+                    for agent in agents:
+                        self.groups[agent].append(rule)
+
+    @classmethod
+    def compile(cls, value):
+        value = quote(value, safe=cls.SAFE)
+        anchored = value.endswith("$")
+        pieces = (value[:-1] if anchored else value).split("*")
+        return len(value), re.compile(".*".join(re.escape(p) for p in pieces) + (r"\Z" if anchored else ""))
+
+    def allowed(self, agent, url):
+        parts = urlsplit(url)
+        target = quote((parts.path or "/") + (f"?{parts.query}" if parts.query else ""), safe=self.SAFE)
+        rules = self.groups.get(agent.lower(), self.groups.get("*", []))
+        matches = [(length, allow) for length, regex, allow in rules if regex.match(target)]
+        return max(matches, default=(0, True))[1]
+
+
+def discover_sitemaps(target):
+    """Sitemaps for a bare site URL: robots.txt declarations, else the first
+    conventional path that isn't a 404. Anything but a 404 stops the search, so
+    a failing sitemap is reported rather than skipped."""
+    base = target.rstrip("/")
+    found = re.match(r"https?://[^/]+", base)
+    if not found:
+        return [base + SITEMAP_PATHS[0]]
+    if base == found.group(0):
+        status, _, body = fetch(base + "/robots.txt")
+        declared = Robots(text(body)).sitemaps if status == 200 else []
+        if declared:
+            return list(dict.fromkeys(declared))
+    for path in SITEMAP_PATHS:
+        if fetch(base + path)[0] != 404:
+            return [base + path]
+    return [base + SITEMAP_PATHS[0]]
+
+
 class Document(HTMLParser):
     """Attribute-order-independent tag data with explicit head placement."""
     def __init__(self, source):
@@ -197,6 +265,13 @@ def meta(h, attr, key):
 def canonical(h):
     return next((attrs.get("href") or "" for tag, attrs, _ in document(h).tags
                  if tag == "link" and "canonical" in (attrs.get("rel") or "").lower().split()), "")
+
+
+def url_key(url):
+    """URL identity: /a and /a/ differ (one usually redirects), while an empty
+    path and / are the same request."""
+    parts = urlsplit(url)
+    return parts._replace(path=parts.path or "/").geturl()
 
 
 def has_noindex(value):
@@ -304,8 +379,9 @@ def analyze(label, status, h, headers=None, self_url=None, size=None):
         problems.append("noindex")
     if not canon:
         problems.append("no canonical")
-    elif self_url and canon.rstrip("/") != self_url.rstrip("/"):
-        problems.append(f"canonical -> {canon}")
+    elif self_url and url_key(canon) != url_key(self_url):
+        slash_only = canon.rstrip("/") == self_url.rstrip("/")
+        problems.append(f"canonical -> {canon}" + (" (differs only by trailing slash)" if slash_only else ""))
     if h1s != 1:
         problems.append(f"{h1s} <h1>")
     if "INVALID" in types:
@@ -335,7 +411,7 @@ def analyze(label, status, h, headers=None, self_url=None, size=None):
     if xrt and header_noindex(xrt) != has_noindex(robots):
         problems.append(f"X-Robots-Tag '{xrt}' disagrees with meta robots '{robots or '-'}'")
     hc = re.search(r'<([^>]+)>\s*;\s*rel="?canonical"?', headers.get("link", ""), re.I)
-    if hc and canon and hc.group(1).rstrip("/") != canon.rstrip("/"):
+    if hc and canon and url_key(hc.group(1)) != url_key(canon):
         problems.append(f"Link header canonical {hc.group(1)} != HTML {canon}")
     problems += placement_problems(doc, "googlebot")
     return dict(label=label, status=status, title=title, desc=desc, canonical=canon, robots=robots,
@@ -416,14 +492,18 @@ def main():
             b = f.read_bytes()
             rows.append(analyze(str(f.relative_to(target)), 200, text(b), size=len(b)))
     else:
-        sm = target if target.endswith(".xml") else target.rstrip("/") + "/sitemap.xml"
+        sitemaps = [target] if target.endswith(".xml") else discover_sitemaps(target)
         try:
-            entries = sitemap_entries(sm)
+            entries = list(dict.fromkeys(e for sm in sitemaps for e in sitemap_entries(sm)))
         except ValueError as exc:
             # Fail closed: never overwrite a previous baseline with partial sitemap data.
             print(f"INCOMPLETE: {exc}", file=sys.stderr)
             sys.exit(2)
-        print(f"{len(entries)} URLs from {sm}", file=sys.stderr)
+        print(f"{len(entries)} URLs from {', '.join(sitemaps)}", file=sys.stderr)
+        site = urlsplit(target)
+        for sm in sitemaps:
+            if (urlsplit(sm).scheme, urlsplit(sm).netloc) != (site.scheme, site.netloc):
+                site_notes.append(f"robots.txt declares a sitemap on another host or scheme: {sm}")
         for u, _ in entries:
             status, headers, body = fetch(u)
             if isinstance(status, int) and 300 <= status < 400:
@@ -456,12 +536,12 @@ def main():
             rows.append(r)
 
         # Reuse fetched targets, but validate their status and effective robots state.
-        fetched = {r["label"].rstrip("/"): r for r in rows}
+        fetched = {url_key(r["label"]): r for r in rows}
         for canon in sorted({r["canonical"] for r in rows if r["canonical"]}):
-            sources = [r for r in rows if r["canonical"] == canon and r["label"].rstrip("/") != canon.rstrip("/")]
+            sources = [r for r in rows if r["canonical"] == canon and url_key(r["label"]) != url_key(canon)]
             if not sources:
                 continue
-            target_row = fetched.get(canon.rstrip("/"))
+            target_row = fetched.get(url_key(canon))
             if target_row:
                 status, noindex = target_row["status"], target_row["noindex"]
             else:
@@ -477,10 +557,9 @@ def main():
         base = re.match(r"https?://[^/]+", entries[0][0]).group(0) if entries else target.rstrip("/")
         rs, _, rb = fetch(base + "/robots.txt")
         if rs == 200:
-            rp = urllib.robotparser.RobotFileParser()
-            rp.parse(text(rb).splitlines())
+            rules = Robots(text(rb))
             for r in rows:
-                if not rp.can_fetch("Googlebot", r["label"]):
+                if not rules.allowed("Googlebot", r["label"]):
                     r["problems"].append("in sitemap but blocked by robots.txt")
         else:
             incomplete.append(f"robots.txt not measured ({rs})")
