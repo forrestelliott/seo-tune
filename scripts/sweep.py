@@ -6,7 +6,7 @@
     sweep.py ./dist                          # prerendered/static HTML files on disk
     --all            print every page, not just problems
     --quick          skip the extra browser/Bingbot fetches (placement check
-                     then covers Googlebot only)
+                     then covers Googlebot only) and internal-link fetches
     --save FILE      write a JSON snapshot of every page's SEO state
     --compare FILE   diff against an earlier snapshot; exit 1 on critical drift
 
@@ -20,8 +20,11 @@ descriptions, canonical present and self-referencing, noindex, one <h1>,
 JSON-LD @types (invalid JSON, http:// schema.org context, structured data on a
 noindex page), share previews (og:title/description/image, twitter:image,
 og:image absolute), HTML size (Googlebot reads the first 2 MB), client-side
-redirects (meta refresh, Next.js NEXT_REDIRECT), and headers vs HTML
-(X-Robots-Tag, Link rel=canonical).
+redirects (meta refresh, Next.js NEXT_REDIRECT), headers vs HTML
+(X-Robots-Tag, Link rel=canonical), snippet limits (nosnippet, max-snippet:0,
+max-image-preview:none, data-nosnippet), og:url vs canonical, twitter:card,
+URLs on localhost or a platform host (usually an unset production URL), and
+a thin raw-HTML body (content that may only render in JavaScript).
 
 Placement: title, canonical and description should each appear once INSIDE
 <head>, for Googlebot, a browser, and Bingbot. Robots tags are optional and
@@ -37,6 +40,12 @@ rules), and lastmod dates must not be in the future or all identical.
 A bare site URL uses the Sitemap: lines in robots.txt, then /sitemap.xml,
 /sitemap-index.xml and /sitemap_index.xml. Sitemap indexes are followed one
 level. /a and /a/ are different URLs; only an empty path equals /.
+
+Internal links (live mode): same-host <a href> targets are fetched once each,
+most-linked first, up to MAX_LINK_CHECKS; links that 404 or redirect and sitemap
+pages with no link from another sitemap page are site notes. Robots-disallowed
+targets are skipped and 401/403 is not judged. A bot-protection response
+(Vercel, Cloudflare) counts as not measured everywhere.
 
 A present, loading share image can still be broken (overlapping text,
 missing font): open every distinct image the summary lists and look at it.
@@ -54,8 +63,8 @@ import sys
 import urllib.request
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
-from urllib.parse import quote, urlsplit
-from collections import Counter
+from urllib.parse import quote, urldefrag, urljoin, urlsplit
+from collections import Counter, defaultdict
 from pathlib import Path
 
 UAS = {
@@ -67,6 +76,15 @@ UA = UAS["googlebot"]
 DESC_MIN, DESC_MAX, TITLE_MAX = 110, 160, 65
 HTML_WARN, HTML_MAX = 1024 * 1024, 2 * 1024 * 1024
 SITEMAP_PATHS = ("/sitemap.xml", "/sitemap-index.xml", "/sitemap_index.xml")
+THIN_WORDS = 30
+MAX_LINK_CHECKS = 300
+LINK_READ_BYTES = 20000
+SNIPPET_LIMITS = {"nosnippet", "max-snippet:0", "max-image-preview:none"}
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+PLATFORM_SUFFIXES = (".vercel.app", ".netlify.app", ".pages.dev", ".herokuapp.com",
+                     ".onrender.com", ".fly.dev", ".railway.app")
+CHALLENGE_TITLE = re.compile(rb"<title[^>]*>\s*(Just a moment\.\.\.|Vercel Security Checkpoint|"
+                             rb"Attention Required! \| Cloudflare)\s*</title>", re.I)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -77,17 +95,33 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_NoRedirect)
 
 
-def fetch(url, ua=UA):
+def fetch(url, ua=UA, limit=None):
     """(status, headers, body) without following redirects. status is an int,
-    or 'ERR <name>' when the request itself failed (not measured)."""
+    or 'ERR <reason>' when the request failed or a bot-protection page answered
+    (not measured). limit caps how many body bytes are read."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": ua})
         with _opener.open(req, timeout=25) as r:
-            return r.status, response_headers(r.headers), r.read()
+            return screened(r.status, response_headers(r.headers), r.read(limit))
     except urllib.error.HTTPError as e:
-        return e.code, response_headers(e.headers), e.read() if e.fp else b""
+        return screened(e.code, response_headers(e.headers), e.read(limit) if e.fp else b"")
     except Exception as e:  # noqa: BLE001
         return f"ERR {e.__class__.__name__}", {}, b""
+
+
+def challenge(headers, body):
+    """What identifies a bot-protection response, or None."""
+    for name in ("x-vercel-mitigated", "cf-mitigated"):
+        if name in headers:
+            return f"{name}: {headers[name]}"
+    match = CHALLENGE_TITLE.search(body[:LINK_READ_BYTES])
+    return match.group(1).decode() if match else None
+
+
+def screened(status, headers, body):
+    # A challenge says nothing about the page behind it, whatever its status.
+    blocked = challenge(headers, body)
+    return (f"ERR bot challenge ({blocked})", headers, body) if blocked else (status, headers, body)
 
 
 def response_headers(headers):
@@ -231,10 +265,14 @@ def discover_sitemaps(target):
 
 class Document(HTMLParser):
     """Attribute-order-independent tag data with explicit head placement."""
+    NOT_VISIBLE = {"script", "style", "noscript", "template", "title"}
+
     def __init__(self, source):
         super().__init__(convert_charrefs=True)
         self.tags = []
         self.in_head = False
+        self.hidden = 0
+        self.words = 0
         self.feed(source)
 
     def handle_starttag(self, tag, attrs):
@@ -242,11 +280,19 @@ class Document(HTMLParser):
             self.in_head = True
         if tag == "body":
             self.in_head = False
+        if tag in self.NOT_VISIBLE:
+            self.hidden += 1
         self.tags.append((tag, dict(attrs), self.in_head))
 
     def handle_endtag(self, tag):
         if tag == "head":
             self.in_head = False
+        if tag in self.NOT_VISIBLE and self.hidden:
+            self.hidden -= 1
+
+    def handle_data(self, data):
+        if not self.hidden and not self.in_head:
+            self.words += len(data.split())
 
 
 def document(h):
@@ -278,26 +324,83 @@ def has_noindex(value):
     return bool(set(re.split(r"[\s,]+", value.lower())) & {"noindex", "none"})
 
 
+def header_directives(value, who="googlebot"):
+    # A crawler prefix scopes following directives until another prefix appears;
+    # each repeated header starts fresh.
+    out = []
+    for line in value.lower().splitlines():
+        scope = None
+        for part in line.split(","):
+            part = part.strip()
+            match = re.match(r"([a-z][\w-]*):\s*(.*)", part)
+            if match and match.group(1) not in ("unavailable_after", "max-snippet", "max-image-preview", "max-video-preview"):
+                scope, part = match.groups()
+            if scope in (None, who):
+                out.append(re.sub(r"\s*:\s*", ":", part))
+    return out
+
+
 def header_noindex(value, who="googlebot"):
-    # A crawler prefix scopes following directives until another prefix appears.
-    if "\n" in value:
-        return any(header_noindex(line, who) for line in value.splitlines())
-    scope = None
-    for part in value.lower().split(","):
-        part = part.strip()
-        match = re.match(r"([a-z][\w-]*):\s*(.*)", part)
-        if match:
-            prefix, directive = match.groups()
-            if prefix not in ("unavailable_after", "max-snippet", "max-image-preview", "max-video-preview"):
-                scope, part = prefix, directive
-        if scope in (None, who) and has_noindex(part):
-            return True
-    return False
+    return has_noindex(" ".join(header_directives(value, who)))
 
 
 def effective_noindex(h, headers=None, who="googlebot"):
     values = meta_values(h, "name", "robots") + meta_values(h, "name", who)
     return any(has_noindex(v) for v in values) or header_noindex(lower_keys(headers).get("x-robots-tag", ""), who)
+
+
+def snippet_problems(doc, headers):
+    """Directives that remove snippets, which AI Overviews and AI Mode also need."""
+    values = meta_values(doc, "name", "robots") + meta_values(doc, "name", "googlebot")
+    directives = [re.sub(r"\s*:\s*", ":", d.strip()) for v in values for d in v.lower().split(",")]
+    directives += header_directives(headers.get("x-robots-tag", ""))
+    limits = sorted(SNIPPET_LIMITS & set(directives))
+    out = [f"snippet restricted: {', '.join(limits)} (limits search snippets and AI Overviews)"] if limits else []
+    held = sum(1 for _, attrs, _ in doc.tags if "data-nosnippet" in attrs)
+    if held:
+        out.append(f"data-nosnippet on {held} element(s) (review: must not wrap main content)")
+    return out
+
+
+def host_of(url):
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def leaked_host(url, site_host):
+    """The host of a URL on localhost or a platform alias that isn't the site itself."""
+    host = host_of(url)
+    if not host or host == site_host:
+        return None
+    return host if host in LOCAL_HOSTS or host.endswith(PLATFORM_SUFFIXES) else None
+
+
+def urls_in(value):
+    if isinstance(value, dict):
+        value = list(value.values())
+    if isinstance(value, list):
+        return [url for item in value for url in urls_in(item)]
+    return [value] if isinstance(value, str) and value.startswith(("http://", "https://")) else []
+
+
+def internal_links(doc, page_url):
+    """Same-host <a href> targets, resolved, without fragments."""
+    base = next((attrs["href"] for tag, attrs, _ in doc.tags if tag == "base" and attrs.get("href")), "")
+    netloc = urlsplit(page_url).netloc.lower()
+    found = set()
+    for tag, attrs, _ in doc.tags:
+        if tag != "a" or not (attrs.get("href") or "").strip():
+            continue
+        try:
+            url = urldefrag(urljoin(urljoin(page_url, base), attrs["href"].strip())).url
+            parts = urlsplit(url)
+        except ValueError:
+            continue
+        if parts.scheme in ("http", "https") and parts.netloc.lower() == netloc:
+            found.add(url_key(url))
+    return sorted(found)
 
 
 def placement_problems(h, who):
@@ -338,7 +441,7 @@ def jsonld_types(data):
 
 def blank_row(url, status, problem):
     return dict(label=url, status=status, title="", desc="", canonical="", robots="", h1=0, types=[],
-                og_image="", noindex=False, x_robots_tag="", ua_checks={}, problems=[problem])
+                og_image="", noindex=False, x_robots_tag="", ua_checks={}, links=[], problems=[problem])
 
 
 def analyze(label, status, h, headers=None, self_url=None, size=None):
@@ -351,18 +454,23 @@ def analyze(label, status, h, headers=None, self_url=None, size=None):
     robots = ", ".join(meta_values(doc, "name", "robots")).lower()
     noindex = effective_noindex(doc, headers)
     h1s = len(re.findall(r"<h1[\s>]", h, re.I))
-    types, http_ctx = [], False
+    types, http_ctx, ld_urls = [], False, []
     for block in re.findall(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', h, re.S | re.I):
         http_ctx = http_ctx or '"http://schema.org' in block
         try:
             data = json.loads(block)
             types.extend(jsonld_types(data))
+            ld_urls.extend(urls_in(data))
         except json.JSONDecodeError:
             types.append("INVALID")
     og_title = meta(doc, "property", "og:title")
     og_desc = meta(doc, "property", "og:description")
     og_image = meta(doc, "property", "og:image") or ""
     tw_image = meta(doc, "name", "twitter:image") or ""
+    tw_card = meta(doc, "name", "twitter:card") or meta(doc, "property", "twitter:card")
+    og_url = meta(doc, "property", "og:url") or ""
+    hreflangs = [attrs.get("href") or "" for tag, attrs, _ in doc.tags
+                 if tag == "link" and "alternate" in (attrs.get("rel") or "").lower().split() and attrs.get("hreflang")]
 
     problems = []
     if status != 200:
@@ -400,6 +508,19 @@ def analyze(label, status, h, headers=None, self_url=None, size=None):
         problems.append("og:image not absolute")
     if not tw_image and not og_image:
         problems.append("no twitter:image")
+    if not tw_card:
+        problems.append("no twitter:card (X may not show a large card)")
+    if og_url and canon and url_key(og_url) != url_key(canon):
+        problems.append(f"og:url {og_url} != canonical {canon}")
+    site_host = host_of(self_url) if self_url else None
+    pointers = [("canonical", canon), ("og:url", og_url), ("og:image", og_image), ("twitter:image", tw_image)]
+    pointers += [("hreflang", u) for u in hreflangs] + [("JSON-LD", u) for u in ld_urls]
+    for where, host in sorted({(where, leaked_host(u, site_host)) for where, u in pointers if leaked_host(u, site_host)}):
+        problems.append(f"wrong host: {where} -> {host} (production URL not set? Next.js: metadataBase)")
+    if not noindex:
+        problems += snippet_problems(doc, headers)
+        if status == 200 and doc.words < THIN_WORDS:
+            problems.append(f"thin HTML body: {doc.words} word(s) before JavaScript (confirm the content renders server-side)")
     if re.search(r'<meta[^>]*http-equiv=["\']refresh["\']', h, re.I) or "NEXT_REDIRECT" in h:
         problems.append("client-side redirect (use a server 301/308)")
     if size:
@@ -415,7 +536,8 @@ def analyze(label, status, h, headers=None, self_url=None, size=None):
         problems.append(f"Link header canonical {hc.group(1)} != HTML {canon}")
     problems += placement_problems(doc, "googlebot")
     return dict(label=label, status=status, title=title, desc=desc, canonical=canon, robots=robots,
-                h1=h1s, types=types, og_image=og_image, noindex=noindex, x_robots_tag=xrt, ua_checks={}, problems=problems)
+                h1=h1s, types=types, og_image=og_image, noindex=noindex, x_robots_tag=xrt, ua_checks={},
+                links=internal_links(doc, self_url) if self_url else [], problems=problems)
 
 
 def snapshot(rows):
@@ -474,6 +596,52 @@ def compare(old, new):
     return crit, warn
 
 
+def check_internal_links(rows, robots, fetch_targets, notes, incomplete):
+    """Site notes for orphan pages and bad links; a failed fetch is not a finding."""
+    known = {url_key(r["label"]): r for r in rows}
+    sources = defaultdict(set)
+    for r in rows:
+        for link in r["links"]:
+            if link != url_key(r["label"]):
+                sources[link].add(r["label"])
+    if not sources:
+        return  # No links at all says more about rendering than about orphans.
+    linked = {link.rstrip("/") for link in sources}
+    orphans = [r["label"] for r in rows if r["status"] == 200 and urlsplit(r["label"]).path.strip("/")
+               and url_key(r["label"]).rstrip("/") not in linked]
+    if orphans:
+        more = f" and {len(orphans) - 20} more" if len(orphans) > 20 else ""
+        notes.append(f"{len(orphans)} page(s) with no link from another sitemap page: {', '.join(orphans[:20])}{more}")
+    if not fetch_targets:
+        notes.append("internal link status not checked (--quick)")
+        return
+    # Most-linked first, so a cap drops the links that matter least.
+    ordered = sorted(sources, key=lambda link: (-len(sources[link]), link))
+    allowed = [link for link in ordered if link in known or robots is None or robots.allowed("Googlebot", link)]
+    unknown = [link for link in allowed if link not in known]
+    checked = set(unknown[:MAX_LINK_CHECKS]) | {link for link in allowed if link in known}
+    if len(unknown) > MAX_LINK_CHECKS:
+        notes.append(f"{len(unknown) - MAX_LINK_CHECKS} internal link target(s) not checked (limit {MAX_LINK_CHECKS})")
+    gated = 0
+    for link in (link for link in allowed if link in checked):
+        if link in known:
+            status, location = known[link]["status"], None
+        else:
+            status, headers, _ = fetch(link, limit=LINK_READ_BYTES)
+            location = lower_keys(headers).get("location")
+        where = f"linked from {len(sources[link])} page(s), e.g. {min(sources[link])}"
+        if not isinstance(status, int) or status == 429 or status >= 500:
+            incomplete.append(f"internal link {link} not measured ({status})")
+        elif status in (401, 403):
+            gated += 1
+        elif 300 <= status < 400:
+            notes.append(f"internal link {link} redirects ({status} -> {location or '?'}); {where}")
+        elif status >= 400:
+            notes.append(f"internal link {link} is {status}; {where}")
+    if gated:
+        notes.append(f"{gated} internal link(s) answered 401/403 (sign-in or access rules; not judged)")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("target")
@@ -501,6 +669,8 @@ def main():
             sys.exit(2)
         print(f"{len(entries)} URLs from {', '.join(sitemaps)}", file=sys.stderr)
         site = urlsplit(target)
+        for host, n in Counter(leaked_host(u, site.hostname) for u, _ in entries if leaked_host(u, site.hostname)).items():
+            site_notes.append(f"{n} sitemap URLs on {host}, not the site's own host")
         for sm in sitemaps:
             if (urlsplit(sm).scheme, urlsplit(sm).netloc) != (site.scheme, site.netloc):
                 site_notes.append(f"robots.txt declares a sitemap on another host or scheme: {sm}")
@@ -556,6 +726,7 @@ def main():
         # robots.txt vs sitemap.
         base = re.match(r"https?://[^/]+", entries[0][0]).group(0) if entries else target.rstrip("/")
         rs, _, rb = fetch(base + "/robots.txt")
+        rules = None
         if rs == 200:
             rules = Robots(text(rb))
             for r in rows:
@@ -563,6 +734,8 @@ def main():
                     r["problems"].append("in sitemap but blocked by robots.txt")
         else:
             incomplete.append(f"robots.txt not measured ({rs})")
+
+        check_internal_links(rows, rules, not quick, site_notes, incomplete)
 
         # lastmod sanity.
         lms = [lm for _, lm in entries if lm]
@@ -626,7 +799,8 @@ def main():
 
     def kind(p):
         for prefix in ("duplicate", "no ", "og:image", "canonical target", "client-side", "sitemap URL redirects",
-                       "in sitemap but", "structured data", "JSON-LD uses", "X-Robots-Tag", "Link header", "not measured"):
+                       "in sitemap but", "structured data", "JSON-LD uses", "X-Robots-Tag", "Link header", "not measured",
+                       "wrong host", "snippet restricted", "thin HTML"):
             if p.startswith(prefix):
                 return prefix.strip()
         if " for googlebot" in p or " for browser" in p or " for bingbot" in p:
@@ -657,7 +831,7 @@ def main():
             parser.error("--save and --compare must be different files")
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(json.dumps({"version": 2, "taken": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-                                   "complete": not incomplete, "incomplete": incomplete,
+                                   "complete": not incomplete, "incomplete": incomplete, "site_notes": site_notes,
                                    "requested_user_agents": list(UAS) if live and not quick else ["googlebot"] if live else [],
                                    "pages": snap}, indent=1) + "\n")
         print(f"snapshot saved: {dest} ({len(snap)} pages)")

@@ -111,7 +111,7 @@ in Codex.
    user agents, per-agent responses, findings, and measurement completeness.
    Legacy snapshots still compare, with a warning that historical headers
    and user-agent coverage are unknown. `--quick` intentionally covers only
-   Googlebot, so do not claim three-agent coverage from it. It reports title/description lengths, duplicates, canonicals,
+   Googlebot and skips internal-link fetches, so do not claim three-agent or link coverage from it. It reports title/description lengths, duplicates, canonicals,
    noindex, h1 count, JSON-LD types, share previews, and:
    - **placement**: title, canonical, and description once each inside
      `<head>`, for Googlebot, a browser, and Bingbot. Robots tags are optional;
@@ -132,6 +132,29 @@ in Codex.
      sitemap declared on another host or scheme, HTML over 1-2 MB (Googlebot
      reads the first 2 MB, uncompressed), http:// schema.org contexts,
      structured data on noindex pages.
+   - **bot protection**: a Vercel or Cloudflare challenge is "not measured"
+     (exit 2), never a finding about the page. A faked Googlebot user agent
+     comes from a non-Google IP, so a challenge is the WAF working. If it stops
+     the scan, audit a built folder or ask the user how to allow the run. The
+     WAF dashboard, not robots.txt, shows whether real crawlers get through.
+   - **wrong-host URLs**: canonical, og:url, share image, hreflang, JSON-LD, or
+     sitemap URLs on localhost or a platform host (`*.vercel.app`,
+     `*.netlify.app`, and similar). A 200 from a preview URL hides this.
+   - **snippet limits**: `nosnippet`, `max-snippet:0`, `max-image-preview:none`,
+     and `data-nosnippet`. AI Overviews and AI Mode need an indexed page that
+     can show a snippet, so confirm each limit is deliberate. These and noindex
+     are the page-level controls; Google-Extended is not one.
+   - **share-card fields**: `og:url` that disagrees with the canonical (often a
+     layout-level value every page inherits) and a missing `twitter:card`.
+   - **thin raw HTML**: under 30 visible words before JavaScript. Head tags can
+     be prerendered while the body renders only in the browser, and many AI
+     crawlers don't run JavaScript. Confirm in a browser before reporting.
+     Facts like pricing should be visible text, not only JSON-LD or a toggle.
+   - **internal links** (live mode; site notes in the summary and snapshot):
+     links that 404 or redirect, and sitemap pages no other sitemap page links
+     to. At most 300 distinct targets, most-linked first; the summary states any
+     cut-off. Robots-disallowed targets are skipped and 401/403 isn't judged.
+     A redirect from an app link to sign-in is normal: judge before reporting.
    Headline counts and title lengths are review heuristics, not proof of
    ranking penalties. Check embedded previews before proposing heading changes.
    Failed fetches are incomplete measurements, not missing metadata; a failed,
@@ -202,7 +225,8 @@ Typical fixes, in priority order. Implement in the project's idiom (Next.js
    present and absolute, 1200x630, under ~600 KB (WhatsApp's limit; a photo
    in a generated PNG easily hits 850 KB), plus og:title/og:description
    matching the page. WhatsApp also needs `<head>` within the first 300 KB of
-   HTML. Framework gotcha: when you add
+   HTML. In Next.js, set `metadataBase` to the production URL so relative
+   image and canonical URLs don't resolve to a preview host. Framework gotcha: when you add
    a per-page metadata helper (Next.js `openGraph`/`twitter` objects, a
    PageMeta component), setting those objects REPLACES the parent's, image
    included. The helper must set the image itself, or inner pages may ship

@@ -16,6 +16,10 @@ HTTP fixtures, regression tests, and an optional IndexNow submission template.
   through robots.txt or the common paths, and metadata placement.
 - Googlebot, Bingbot, and browser **user-agent response differences**. These are
   HTTP requests with those headers, not requests from verified crawler IPs.
+- Internal links that 404 or redirect, sitemap pages nothing links to,
+  snippet limits, URLs leaking a preview or local host, share-card fields, and
+  pages whose raw HTML has almost no body text.
+- Vercel and Cloudflare bot challenges, reported as not measured.
 - Critical drift between scans, including new noindex, failed pages, changed
   canonicals, lost schema types, and missing share images.
 
@@ -64,8 +68,9 @@ python3 scripts/sweep.py https://example.com --compare /tmp/seo-before.json --sa
 python3 scripts/sweep.py /path/to/project/dist
 ```
 
-The sweep defaults to all three user agents. `--quick` checks only Googlebot;
-`--all` prints every page instead of just findings.
+The sweep defaults to all three user agents. `--quick` checks only Googlebot
+and skips internal-link fetches; `--all` prints every page instead of just
+findings.
 
 | Sweep exit code | Meaning |
 | --- | --- |
@@ -82,7 +87,8 @@ JavaScript executes, and they do not replace browser or rendered-image checks.
 
 `hosts.sh` prints human-reviewed diagnostics; its exit code is not a pass/fail
 SEO gate. Live audits make network requests to sitemap URLs, canonical targets,
-share images, and the host variants/subdomains shown in the script. Review the
+share images, same-host link targets (up to 300, skipping paths robots.txt
+disallows), and the host variants/subdomains shown in the script. Review the
 scope before running on an unfamiliar site.
 
 ## Test
@@ -106,8 +112,8 @@ python3 tests/fixture_server.py --port 0
 ```
 
 The printed URL serves `/clean.xml` (clean control), `/sitemap.xml` (intentional
-faults), `/bad-index.xml` (failed child sitemap), and `/ua-failure.xml` (one
-user-agent response unavailable).
+faults), `/bad-index.xml` (failed child sitemap), `/ua-failure.xml` (one
+user-agent response unavailable), and `/challenge.xml` (a bot-protection page).
 
 ## IndexNow
 

@@ -10,6 +10,33 @@ HOSTS = Path(__file__).resolve().parents[1] / 'scripts/hosts.sh'
 
 
 class HostsTests(unittest.TestCase):
+    def test_bot_challenge_reported_as_not_measured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            curl = root / 'curl'
+            curl.write_text('#!' + sys.executable + '''
+import sys
+from pathlib import Path
+args = sys.argv[1:]
+if '-D' in args:
+    dest = args[args.index('-D') + 1]
+    header = 'x-vercel-mitigated: challenge\\n'
+    if dest == '-': print(header)
+    else: Path(dest).write_text(header)
+if '-w' in args:
+    sys.stdout.write('__STATUS__429 ' if '__STATUS__' in args[args.index('-w') + 1] else '429 ')
+''')
+            curl.chmod(0o755)
+            python = root / 'python3'
+            python.write_text('#!/bin/sh\ncat >/dev/null\n')
+            python.chmod(0o755)
+            result = subprocess.run(['bash', str(HOSTS), 'example.test'],
+                                    env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH']},
+                                    capture_output=True, text=True, timeout=10)
+            line = lambda text: next(l for l in result.stdout.splitlines() if text in l)
+            self.assertIn('bot challenge', line('https://example.test/ '))
+            self.assertIn('bot challenge', line('https://staging.example.test/'))
+
     def test_crawler_table_loads_shared_parser(self):
         """Real Python, fake curl: reserved .test never resolves, so the table
         must reach its 'not measured' path rather than fail importing sweep."""

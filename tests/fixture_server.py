@@ -29,7 +29,8 @@ def page(base, path, head_extra='', body_extra='', canon=None):
             f'<meta property="og:description" content="Fixture {path}">'
             f'<meta property="og:image" content="{base}/img.png">'
             f'<meta name="twitter:image" content="{base}/img.png">'
-            f'{head_extra}</head><body><h1>Fixture</h1>{body_extra}</body></html>')
+            f'<meta name="twitter:card" content="summary_large_image">'
+            f'{head_extra}</head><body><h1>Fixture</h1><p>{"word " * 40}</p>{body_extra}</body></html>')
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -39,8 +40,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         base = f'http://127.0.0.1:{self.server.server_port}'
         path = self.path
-        if path in ('/sitemap.xml', '/clean.xml', '/ua-failure.xml'):
-            paths = PATHS if path == '/sitemap.xml' else ['/ok'] if path == '/clean.xml' else ['/ua-failure']
+        if path in ('/sitemap.xml', '/clean.xml', '/ua-failure.xml', '/challenge.xml'):
+            paths = {'/sitemap.xml': PATHS, '/clean.xml': ['/ok'], '/ua-failure.xml': ['/ua-failure'], '/challenge.xml': ['/challenged']}[path]
             date = '2099-01-01' if path == '/sitemap.xml' else '2026-01-01'
             body = '<urlset>' + ''.join(f'<url><loc>{base}{p}</loc><lastmod>{date}</lastmod></url>' for p in paths) + '</urlset>'
             return self.send(200, {'Content-Type': 'application/xml'}, body)
@@ -54,6 +55,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, {'Content-Type': 'image/png'}, IMAGES[path])
         if path == '/temp-redirect':
             return self.send(307, {'Location': base + '/ok'}, '')
+        if path == '/challenged':
+            return self.send(200, {'x-vercel-mitigated': 'challenge'}, '<html><title>Vercel Security Checkpoint</title></html>')
         if path == '/ua-failure' and 'bot' not in self.headers.get('User-Agent', '').lower():
             return self.send(503, {}, 'Browser temporarily unavailable')
         if path not in PATHS + ['/ua-failure']:

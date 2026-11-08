@@ -82,6 +82,13 @@ class FixtureTests(unittest.TestCase):
             self.assertIn('503', result.stderr)
             self.assertEqual(dest.read_text(), 'original')
 
+    def test_bot_challenge_is_not_measured(self):
+        result = self.run_sweep('/challenge.xml')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('bot challenge', result.stdout)
+        self.assertNotIn('no <title>', result.stdout)
+        self.assertNotIn('no canonical', result.stdout)
+
     def test_ua_outage_cli_exit_two(self):
         result = self.run_sweep('/ua-failure.xml')
         self.assertEqual(result.returncode, 2)

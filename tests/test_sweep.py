@@ -16,7 +16,7 @@ spec.loader.exec_module(s)
 URL = "https://example.test/"
 
 
-def page(extra="", canonical=None):
+def page(extra="", canonical=None, body=""):
     return ('<html><head><title>Example page</title>'
             '<meta name="description" content="' + 'd' * 130 + '">'
             + (canonical or f'<link rel="canonical" href="{URL}">')
@@ -24,7 +24,8 @@ def page(extra="", canonical=None):
             '<meta property="og:description" content="Example description">'
             '<meta property="og:image" content="https://example.test/card.png">'
             '<meta name="twitter:image" content="https://example.test/card.png">'
-            + extra + '</head><body><h1>Example</h1></body></html>')
+            '<meta name="twitter:card" content="summary_large_image">'
+            + extra + '</head><body><h1>Example</h1><p>' + 'word ' * 40 + '</p>' + body + '</body></html>')
 
 
 def row(html=None, headers=None):
@@ -160,9 +161,11 @@ class SweepTests(unittest.TestCase):
     def test_truncated_image_does_not_crash(self):
         self.assertIsNone(s.image_size(b'\x89PNG\r\n\x1a\n'))
 
-    def run_live_mock(self, override):
+    def run_live_mock(self, override, *args):
         from fixture_server import IMAGES
-        def fetch(url, ua=s.UA):
+        self.requested = requested = []
+        def fetch(url, ua=s.UA, limit=None):
+            requested.append(url)
             result = override(url, ua)
             if result is not None:
                 return result
@@ -175,7 +178,7 @@ class SweepTests(unittest.TestCase):
             return 200, {}, page().encode()
         with tempfile.TemporaryDirectory() as tmp, patch.object(s, 'fetch', side_effect=fetch):
             dest = Path(tmp) / 'snapshot.json'
-            code, output = cli([URL, '--save', str(dest)])
+            code, output = cli([URL, '--save', str(dest), *args])
             return code, output, json.loads(dest.read_text())
 
     def test_browser_outage_recorded_and_exits_incomplete(self):
@@ -340,6 +343,176 @@ class SweepTests(unittest.TestCase):
         code, output, _ = self.run_live_mock(override)
         self.assertEqual(code, 0)
         self.assertIn('robots.txt declares a sitemap on another host', output)
+
+    # Bot protection
+    def test_challenge_headers_and_titles_are_recognized(self):
+        self.assertIn('x-vercel-mitigated', s.challenge({'x-vercel-mitigated': 'challenge'}, b''))
+        self.assertIn('cf-mitigated', s.challenge({'cf-mitigated': 'challenge'}, b''))
+        for title in (b'Just a moment...', b'Vercel Security Checkpoint', b'Attention Required! | Cloudflare'):
+            with self.subTest(title=title):
+                self.assertTrue(s.challenge({}, b'<html><title>' + title + b'</title></html>'))
+        self.assertIsNone(s.challenge({'x-vercel-id': 'abc', 'cf-ray': '1'}, page().encode()))
+
+    # Wrong-host URLs
+    def test_preview_and_local_urls_are_flagged(self):
+        h = page('<meta property="og:url" content="https://proj-abc.vercel.app/">'
+                 '<link rel="alternate" hreflang="de" href="http://localhost:3000/de">'
+                 '<script type="application/ld+json">{"@type":"Organization","logo":"https://x.netlify.app/l.png"}</script>')
+        problems = ' | '.join(s.analyze(URL, 200, h, self_url=URL)['problems'])
+        for text in ('wrong host: og:url -> proj-abc.vercel.app', 'wrong host: hreflang -> localhost', 'wrong host: JSON-LD -> x.netlify.app'):
+            self.assertIn(text, problems)
+
+    def test_own_platform_host_and_cdn_are_not_wrong_hosts(self):
+        h = page().replace('https://example.test/card.png', 'https://res.cloudinary.com/x/card.png')
+        self.assertFalse([p for p in s.analyze(URL, 200, h, self_url=URL)['problems'] if p.startswith('wrong host')])
+        app = 'https://acme.vercel.app/'
+        h = page(canonical=f'<link rel="canonical" href="{app}">').replace('https://example.test/card.png', app + 'card.png')
+        self.assertFalse([p for p in s.analyze(app, 200, h, self_url=app)['problems'] if p.startswith('wrong host')])
+
+    def test_wrong_host_found_without_self_url_in_built_folder(self):
+        h = page().replace('https://example.test/card.png', 'http://localhost:3000/card.png')
+        self.assertTrue(any(p.startswith('wrong host: og:image') for p in s.analyze('index.html', 200, h)['problems']))
+
+    def test_sitemap_loc_on_preview_host_is_noted(self):
+        def override(url, ua):
+            if url.endswith('/sitemap.xml'):
+                return 200, {}, b'<urlset><url><loc>https://proj.vercel.app/a</loc></url></urlset>'
+        code, output, _ = self.run_live_mock(override)
+        self.assertIn('sitemap URLs on proj.vercel.app', output)
+
+    # Snippet limits
+    def test_snippet_limits_from_meta_and_header(self):
+        for extra, headers, text in [('<meta name="robots" content="nosnippet">', None, 'nosnippet'),
+                                     ('<meta name="googlebot" content="max-snippet:0">', None, 'max-snippet:0'),
+                                     ('<meta name="robots" content="max-image-preview:none">', None, 'max-image-preview:none'),
+                                     ('', {'X-Robots-Tag': 'nosnippet'}, 'nosnippet'),
+                                     ('', {'X-Robots-Tag': 'googlebot: max-snippet: 0'}, 'max-snippet:0')]:
+            with self.subTest(extra=extra, headers=headers):
+                self.assertTrue(any(p.startswith('snippet restricted') and text in p for p in row(page(extra), headers)['problems']))
+
+    def test_harmless_snippet_settings_and_other_bots_pass(self):
+        for extra, headers in [('<meta name="robots" content="max-snippet:-1, max-image-preview:large">', None),
+                               ('<meta name="robots" content="max-snippet:120">', None),
+                               ('', {'X-Robots-Tag': 'bingbot: nosnippet'})]:
+            with self.subTest(extra=extra, headers=headers):
+                self.assertFalse([p for p in row(page(extra), headers)['problems'] if p.startswith('snippet restricted')])
+
+    def test_data_nosnippet_is_a_review_item(self):
+        r = row(page(body='<div data-nosnippet>x</div><span data-nosnippet>y</span>'))
+        self.assertTrue(any(p.startswith('data-nosnippet on 2') for p in r['problems']))
+
+    # Share-card fields
+    def test_og_url_must_match_canonical(self):
+        r = s.analyze(URL + 'a', 200, page('<meta property="og:url" content="https://example.test/">',
+                                           canonical=f'<link rel="canonical" href="{URL}a">'), self_url=URL + 'a')
+        self.assertTrue(any(p.startswith('og:url') and 'canonical' in p for p in r['problems']), r['problems'])
+
+    def test_matching_og_url_passes(self):
+        self.assertEqual(row(page(f'<meta property="og:url" content="{URL}">'))['problems'], [])
+
+    def test_missing_twitter_card_is_reported(self):
+        h = page().replace('<meta name="twitter:card" content="summary_large_image">', '')
+        self.assertTrue(any(p.startswith('no twitter:card') for p in row(h)['problems']))
+
+    def test_twitter_card_as_property_counts(self):
+        h = page().replace('name="twitter:card"', 'property="twitter:card"')
+        self.assertEqual(row(h)['problems'], [])
+
+    # Thin raw HTML
+    def test_client_rendered_body_is_flagged(self):
+        h = page().replace('<p>' + 'word ' * 40 + '</p>', '<div id="root"></div><script>' + 'var a = 1; ' * 200 + '</script>'
+                           '<noscript>' + 'enable javascript please ' * 20 + '</noscript>')
+        self.assertTrue(any(p.startswith('thin HTML body') for p in row(h)['problems']), row(h)['problems'])
+
+    def test_thin_body_not_reported_on_noindex_pages(self):
+        h = page('<meta name="robots" content="noindex">').replace('word ' * 40, '')
+        self.assertFalse([p for p in row(h)['problems'] if p.startswith('thin HTML body')])
+
+    # Internal links
+    def site(self, pages):
+        """Override serving a sitemap of the given {path: html} pages."""
+        def override(url, ua):
+            if url.endswith('/sitemap.xml'):
+                return 200, {}, ('<urlset>' + ''.join(f'<url><loc>{URL}{p}</loc></url>' for p in pages) + '</urlset>').encode()
+            path = url[len(URL):]
+            if path in pages:
+                return 200, {}, page(canonical=f'<link rel="canonical" href="{url}">', body=pages[path]).encode()
+        return override
+
+    def test_broken_and_redirecting_links_are_noted(self):
+        base = self.site({'': '<a href="/gone">a</a><a href="old#frag">b</a><a href="/ok">c</a>', 'ok': '<a href="/">home</a>'})
+        def override(url, ua):
+            if url == URL + 'gone':
+                return 404, {}, b''
+            if url == URL + 'old':
+                return 308, {'Location': URL + 'new'}, b''
+            return base(url, ua)
+        code, output, snap = self.run_live_mock(override)
+        self.assertEqual(code, 0)
+        self.assertIn(f'internal link {URL}gone is 404', output)
+        self.assertIn(f'internal link {URL}old redirects (308 -> {URL}new)', output)
+        self.assertNotIn(f'internal link {URL}ok', output)
+        self.assertTrue(any('is 404' in note for note in snap['site_notes']))
+
+    def test_external_and_special_links_are_not_fetched(self):
+        code, _, _ = self.run_live_mock(self.site({'': '<a href="https://other.test/x">a</a><a href="mailto:a@example.test">b</a>'
+                                                       '<a href="tel:1">c</a><a href="javascript:void(0)">d</a><a href="#top">e</a>'}))
+        self.assertEqual(code, 0)
+        self.assertNotIn('https://other.test/x', self.requested)
+
+    def test_gated_links_are_not_judged(self):
+        base = self.site({'': '<a href="/account">a</a>'})
+        code, output, _ = self.run_live_mock(lambda url, ua: (401, {}, b'') if url == URL + 'account' else base(url, ua))
+        self.assertEqual(code, 0)
+        self.assertNotIn(f'internal link {URL}account is', output)
+        self.assertIn('1 internal link(s) answered 401/403', output)
+
+    def test_failed_link_fetch_is_incomplete_not_broken(self):
+        for status in (503, 429, 'ERR URLError', 'ERR bot challenge (cf-mitigated: challenge)'):
+            base = self.site({'': '<a href="/x">a</a>'})
+            with self.subTest(status=status):
+                code, output, _ = self.run_live_mock(lambda url, ua: (status, {}, b'') if url == URL + 'x' else base(url, ua))
+                self.assertEqual(code, 2)
+                self.assertIn(f'internal link {URL}x not measured ({status})', output)
+
+    def test_robots_disallowed_links_are_not_fetched(self):
+        base = self.site({'': '<a href="/private/x">a</a>'})
+        def override(url, ua):
+            if url.endswith('/robots.txt'):
+                return 200, {}, b'User-agent: *\nDisallow: /private/\n'
+            return base(url, ua)
+        code, _, _ = self.run_live_mock(override)
+        self.assertEqual(code, 0)
+        self.assertNotIn(URL + 'private/x', self.requested)
+
+    def test_orphan_sitemap_pages_are_noted(self):
+        code, output, _ = self.run_live_mock(self.site({'': '<a href="/linked">a</a>', 'linked': '<a href="/">a</a>', 'orphan': '<a href="/orphan">self</a>'}))
+        self.assertEqual(code, 0)
+        self.assertIn('no link from another sitemap page', output)
+        self.assertIn(URL + 'orphan', output)
+        self.assertNotIn(f'{URL}linked,', output)
+
+    def test_trailing_slash_link_still_counts_as_inbound(self):
+        _, output, _ = self.run_live_mock(self.site({'': '<a href="/a/">a</a>', 'a': '<a href="/">a</a>'}))
+        self.assertNotIn('no link from another sitemap page', output)
+
+    def test_no_links_anywhere_is_not_reported_as_orphans(self):
+        _, output, _ = self.run_live_mock(self.site({'': '', 'a': ''}))
+        self.assertNotIn('no link from another sitemap page', output)
+
+    def test_link_fetches_are_capped_and_disclosed(self):
+        links = {'': '<a href="/x1">a</a><a href="/x2">b</a><a href="/x3">c</a>'}
+        with patch.object(s, 'MAX_LINK_CHECKS', 1):
+            code, output, _ = self.run_live_mock(self.site(links))
+        self.assertEqual(code, 0)
+        self.assertIn('2 internal link target(s) not checked', output)
+        self.assertEqual(sum(1 for u in self.requested if u.startswith(URL + 'x')), 1)
+
+    def test_quick_skips_link_fetches_and_says_so(self):
+        code, output, _ = self.run_live_mock(self.site({'': '<a href="/x">a</a>'}), '--quick')
+        self.assertEqual(code, 0)
+        self.assertNotIn(URL + 'x', self.requested)
+        self.assertIn('internal link status not checked (--quick)', output)
 
     def test_same_save_compare_path_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

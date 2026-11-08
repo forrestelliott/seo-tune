@@ -23,12 +23,18 @@ MAIN="${1:?usage: hosts.sh canonical-host [alt-hosts...]}"
 shift
 UA="Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CHALLENGE_NOTE=" (bot challenge: not measured)"
+
+# True when saved response headers show a Vercel or Cloudflare challenge.
+challenged() { grep -qiE '^(x-vercel-mitigated|cf-mitigated):' "$1" 2>/dev/null; }
 
 head_line() {
-  curl -sS -o /dev/null -A "$UA" --max-time 15 \
+  : > "$PROBE_DIR/head"
+  curl -sS -D "$PROBE_DIR/head" -o /dev/null -A "$UA" --max-time 15 \
     -w "%{http_code} %{redirect_url}" "$1" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ]; then printf " (not measured: curl exit %s)" "$rc"; fi
+  if challenged "$PROBE_DIR/head"; then printf '%s' "$CHALLENGE_NOTE"; fi
 }
 
 echo "== Canonical host variants"
@@ -47,7 +53,9 @@ done
 echo
 echo "== Crawl files and headers"
 for p in /robots.txt /sitemap.xml /; do
-  code=$(curl -sS -o /dev/null -A "$UA" --max-time 15 -w "%{http_code}" "https://$MAIN$p")
+  : > "$PROBE_DIR/head"
+  code=$(curl -sS -D "$PROBE_DIR/head" -o /dev/null -A "$UA" --max-time 15 -w "%{http_code}" "https://$MAIN$p")
+  if challenged "$PROBE_DIR/head"; then code="$code$CHALLENGE_NOTE"; fi
   xrt=$(curl -sS -D - -o /dev/null -A "$UA" --max-time 15 "https://$MAIN$p" | grep -i '^x-robots-tag' | tr -d '\r')
   printf '%-40s %s %s\n' "https://$MAIN$p" "$code" "${xrt:-}"
 done
@@ -55,8 +63,10 @@ done
 echo
 echo "== Soft 404 probe (want 404/410, or 200 with noindex)"
 junk="https://$MAIN/seo-tune-probe-$(date +%s)"
-body=$(curl -sS -A "$UA" --max-time 15 -w '\n__STATUS__%{http_code}' "$junk")
+: > "$PROBE_DIR/head"
+body=$(curl -sS -D "$PROBE_DIR/head" -A "$UA" --max-time 15 -w '\n__STATUS__%{http_code}' "$junk")
 status=${body##*__STATUS__}
+if challenged "$PROBE_DIR/head"; then status="$status$CHALLENGE_NOTE"; fi
 title=$(printf '%s' "$body" | grep -o '<title[^>]*>[^<]*' | head -1 | sed 's/<title[^>]*>//')
 robots=$(printf '%s' "$body" | grep -oi '<meta[^>]*name="robots"[^>]*>' | head -1)
 echo "$junk"
@@ -75,6 +85,8 @@ for sub in staging dev preview beta test; do
   if [ "$rc" -ne 0 ]; then
     if [ "$rc" -eq 6 ]; then verdict="DNS resolution failed (not measured)"
     else verdict="not measured (curl exit $rc: transport, TLS, timeout, or sandbox failure)"; fi
+  elif printf '%s\n' "$out" | grep -qiE '^(x-vercel-mitigated|cf-mitigated):'; then
+    verdict="bot challenge (not measured)"
   else
   case "$status" in
     000*) verdict="not measured (no HTTP response)";;
